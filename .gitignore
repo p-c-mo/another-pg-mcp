@@ -9,3 +9,5 @@ dist/
 CLAUDE.md
 AGENTS.md 
 *.claude
+
+*-diag.sh
