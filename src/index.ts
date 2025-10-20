@@ -1,102 +1,167 @@
 #!/usr/bin/env node
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import {
-  CallToolRequestSchema,
-  ErrorCode,
-  ListToolsRequestSchema,
-  McpError,
-} from '@modelcontextprotocol/sdk/types.js';
+import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
+import type { LoggingLevel, TextContent } from '@modelcontextprotocol/sdk/types.js';
 import { Client } from 'pg';
+import { z } from 'zod';
 import { QueryValidator } from './queryValidator.js';
 
-interface QueryArgs {
-  query: string;
-  connectionString?: string;
-}
+const QueryInputShape = {
+  query: z.string().describe('SQL to execute'),
+  connectionString: z
+    .string()
+    .optional()
+    .describe('Overrides DATABASE_URL'),
+  params: z
+    .array(z.union([z.string(), z.number(), z.boolean(), z.null()]))
+    .optional()
+    .describe('Positional parameters ($1, $2, ...)'),
+  maxRows: z
+    .number()
+    .int()
+    .positive()
+    .max(1_000_000)
+    .optional()
+    .describe('Optional row limit applied server-side (defaults to 10)'),
+  timeoutMs: z
+    .number()
+    .int()
+    .positive()
+    .max(600_000)
+    .optional()
+    .describe('Per-query statement timeout'),
+};
+
+const QueryInputSchema = z.object(QueryInputShape);
+
+const QueryOutputShape = {
+  rowCount: z.number(),
+  rows: z.array(z.record(z.any())),
+  fields: z
+    .array(z.object({ name: z.string(), dataTypeID: z.number() }))
+    .optional(),
+};
+
+const QueryOutputSchema = z.object(QueryOutputShape);
+
+type QueryArgs = z.infer<typeof QueryInputSchema>;
+type QueryResult = z.infer<typeof QueryOutputSchema>;
 
 class PostgresServer {
-  private server: Server;
+  private readonly mcp: McpServer;
   private connections: Map<string, Client> = new Map();
-  private readOnlyMode: boolean;
-  private queryValidator: QueryValidator;
+  private readonly readOnlyMode: boolean;
+  private readonly queryValidator: QueryValidator;
+  private readonly serverName: string;
 
   constructor() {
-    const serverName = process.env.MCP_SERVER_NAME;
-    if (!serverName) {
-      throw new Error('MCP_SERVER_NAME environment variable is required');
-    }
-    
+    this.serverName = process.env.MCP_SERVER_NAME ?? 'postgres-mcp';
+
     // Default to read-only mode unless explicitly disabled
     this.readOnlyMode = process.env.READ_ONLY_MODE !== 'false';
     this.queryValidator = new QueryValidator(this.readOnlyMode);
-    
-    this.server = new Server(
+
+    this.mcp = new McpServer(
       {
-        name: serverName,
+        name: this.serverName,
         version: '1.0.0',
       },
       {
         capabilities: {
-          tools: {},
+          logging: {},
         },
       }
     );
+    this.mcp.server.registerCapabilities({ logging: {} });
 
-    this.setupHandlers();
+    this.registerTools();
   }
 
-  private setupHandlers() {
-    const serverName = process.env.MCP_SERVER_NAME!;
-    const toolName = `${serverName}_query`;
-    
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: [
-        {
-          name: toolName,
-          description: 'Execute a PostgreSQL query',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              query: {
-                type: 'string',
-                description: 'The SQL query to execute',
-              },
-              connectionString: {
-                type: 'string',
-                description: 'PostgreSQL connection string (uses DATABASE_URL env var if not provided)',
-              },
-            },
-            required: ['query'],
-          },
-        },
-      ],
-    }));
+  private registerTools() {
+    this.mcp.registerTool(
+      'query',
+      {
+        title: 'PostgreSQL Query',
+        description: 'Execute a PostgreSQL query with optional parameters',
+        inputSchema: QueryInputShape,
+        outputSchema: QueryOutputShape,
+        annotations: { readOnlyHint: this.readOnlyMode },
+      },
+      async (args) => this.executeQuery(args)
+    );
+  }
 
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      if (request.params.name !== toolName) {
-        throw new McpError(
-          ErrorCode.MethodNotFound,
-          `Unknown tool: ${request.params.name}`
-        );
-      }
+  private async log(level: LoggingLevel, data: unknown) {
+    if (!this.mcp.isConnected()) {
+      return;
+    }
 
-      const args = request.params.arguments as unknown as QueryArgs;
-      
-      if (!args.query) {
-        throw new McpError(
-          ErrorCode.InvalidParams,
-          'Query parameter is required'
-        );
-      }
-
-      return await this.executeQuery(args);
+    await this.mcp.sendLoggingMessage({
+      level,
+      logger: 'postgres-mcp',
+      data,
     });
+  }
+
+  private async ensureClient(connectionString: string): Promise<Client> {
+    const connectionKey = connectionString;
+
+    let client = this.connections.get(connectionKey);
+
+    if (!client) {
+      client = new Client({ connectionString });
+      try {
+        await client.connect();
+
+        // Set read-only mode at the session level if enabled
+        if (this.readOnlyMode) {
+          await client.query('SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY');
+          await this.log('info', {
+            message: 'Connection established in read-only mode',
+            readOnlyMode: this.readOnlyMode,
+          });
+        }
+
+        this.connections.set(connectionKey, client);
+      } catch (error) {
+        throw new McpError(
+          ErrorCode.InternalError,
+          `Failed to connect to database: ${error instanceof Error ? error.message : 'Unknown error'}`
+        );
+      }
+    }
+
+    return client;
+  }
+
+  private buildQuery(args: QueryArgs) {
+    const sanitizedQuery = args.query.trim().replace(/;+\s*$/u, '');
+    const values = [...(args.params ?? [])];
+    const effectiveMaxRows = args.maxRows ?? 10;
+
+    const shouldLimit =
+      typeof effectiveMaxRows === 'number' &&
+      effectiveMaxRows > 0 &&
+      /^select/i.test(sanitizedQuery);
+
+    if (shouldLimit) {
+      const limitParamPosition = values.length + 1;
+      return {
+        text: `SELECT * FROM (${sanitizedQuery}) AS __mcp_query LIMIT $${limitParamPosition}`,
+        values: [...values, effectiveMaxRows],
+      };
+    }
+
+    return {
+      text: sanitizedQuery,
+      values,
+    };
   }
 
   private async executeQuery(args: QueryArgs) {
     const connectionString = args.connectionString || process.env.DATABASE_URL;
-    
+
     if (!connectionString) {
       throw new McpError(
         ErrorCode.InvalidParams,
@@ -107,69 +172,78 @@ class PostgresServer {
     // Validate the query before execution
     this.queryValidator.validateOrThrow(args.query);
 
-    const connectionKey = connectionString;
-    
-    let client = this.connections.get(connectionKey);
-    
-    if (!client) {
-      client = new Client({ connectionString });
-      try {
-        await client.connect();
-        
-        // Set read-only mode at the session level if enabled
-        if (this.readOnlyMode) {
-          await client.query('SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY');
-          console.error('Read-only mode enabled for this connection');
-        }
-        
-        this.connections.set(connectionKey, client);
-      } catch (error) {
-        throw new McpError(
-          ErrorCode.InternalError,
-          `Failed to connect to database: ${error instanceof Error ? error.message : 'Unknown error'}`
-        );
-      }
-    }
+    const client = await this.ensureClient(connectionString);
+
+    const { text, values } = this.buildQuery(args);
 
     try {
-      const result = await client.query(args.query);
-      
+      if (args.timeoutMs) {
+        await client.query('SET statement_timeout = $1', [args.timeoutMs]);
+      }
+
+      const result = await client.query({ text, values });
+      const rowCount = typeof result.rowCount === 'number' ? result.rowCount : result.rows.length;
+
+      const structuredContent: QueryResult = {
+        rowCount,
+        rows: result.rows,
+        fields: result.fields?.map((field) => ({
+          name: field.name,
+          dataTypeID: field.dataTypeID,
+        })),
+      };
+
       return {
+        structuredContent,
         content: [
           {
             type: 'text',
-            text: JSON.stringify({
-              rowCount: result.rowCount,
-              rows: result.rows,
-              fields: result.fields?.map(f => ({
-                name: f.name,
-                dataTypeID: f.dataTypeID,
-              })),
-            }, null, 2),
-          },
+            text: JSON.stringify(structuredContent, null, 2),
+          } satisfies TextContent,
         ],
       };
     } catch (error) {
       return {
+        isError: true,
         content: [
           {
             type: 'text',
-            text: JSON.stringify({
-              error: true,
-              message: error instanceof Error ? error.message : 'Unknown error',
-            }, null, 2),
-          },
+            text: error instanceof Error ? error.message : 'Unknown error',
+          } satisfies TextContent,
         ],
       };
+    } finally {
+      if (args.timeoutMs) {
+        try {
+          await client.query('RESET statement_timeout');
+        } catch (resetError) {
+          await this.log('warning', {
+            message: 'Failed to reset statement_timeout after query',
+            error: resetError instanceof Error ? resetError.message : String(resetError),
+          });
+        }
+      }
     }
   }
 
   async run() {
     const transport = new StdioServerTransport();
-    await this.server.connect(transport);
-    console.error(`${process.env.MCP_SERVER_NAME} server running on stdio`);
+    try {
+      await this.mcp.connect(transport);
+      await this.log('info', { message: `${this.serverName} server running on stdio` });
+    } catch (error) {
+      if (this.mcp.isConnected()) {
+        await this.log('error', {
+          message: 'Server failed to start',
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      throw error;
+    }
   }
 }
 
 const server = new PostgresServer();
-server.run().catch(console.error);
+server.run().catch(() => {
+  process.exit(1);
+});
