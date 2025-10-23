@@ -1,18 +1,48 @@
 #!/usr/bin/env node
+import dotenv from 'dotenv';
+import cors from 'cors';
+import express, { type Request, type Response } from 'express';
+import { randomUUID } from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+import { ErrorCode, McpError, isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import type { LoggingLevel, TextContent } from '@modelcontextprotocol/sdk/types.js';
 import { Client } from 'pg';
 import { z } from 'zod';
 import { QueryValidator } from './queryValidator.js';
 
+dotenv.config();
+
+const SERVER_NAME = process.env.MCP_SERVER_NAME ?? 'postgres-mcp';
+
+const DATABASE_URL = (() => {
+  const value = process.env.DATABASE_URL;
+  if (!value) {
+    console.error(
+      `[${SERVER_NAME}] DATABASE_URL environment variable is required. Define it in your environment or .env file before starting the server.`
+    );
+    process.exit(1);
+  }
+  return value;
+})();
+
+const resolveReadOnlyMode = (): boolean => {
+  const raw = process.env.MCP_READ_ONLY_MODE ?? process.env.READ_ONLY_MODE;
+  if (typeof raw !== 'string') {
+    return true;
+  }
+
+  const normalized = raw.trim().toLowerCase();
+  if (normalized.length === 0) {
+    return true;
+  }
+
+  return normalized !== 'false';
+};
+
 const QueryInputShape = {
   query: z.string().describe('SQL to execute'),
-  connectionString: z
-    .string()
-    .optional()
-    .describe('Overrides DATABASE_URL'),
   params: z
     .array(z.union([z.string(), z.number(), z.boolean(), z.null()]))
     .optional()
@@ -46,7 +76,6 @@ const QueryOutputShape = {
 const QueryOutputSchema = z.object(QueryOutputShape);
 
 const PredefinedQueryInputShape = {
-  connectionString: QueryInputShape.connectionString,
   maxRows: QueryInputShape.maxRows,
   timeoutMs: QueryInputShape.timeoutMs,
   schema: z
@@ -105,7 +134,7 @@ table_comments AS (
 SELECT
   tc.schemaname,
   tc.tablename,
-  'CREATE TABLE ' || tc.schemaname || '.' || tc.tablename || E'(\\n' ||
+  'CREATE TABLE ' || tc.schemaname || '.' || tc.tablename || E'(\n' ||
   array_to_string(
     array_agg(
       '    ' || tc.column_name || ' ' || tc.type ||
@@ -113,19 +142,19 @@ SELECT
       CASE WHEN tc.default_value IS NOT NULL THEN ' DEFAULT ' || tc.default_value ELSE '' END
       ORDER BY tc.attnum
     ),
-    E',\\n'
-  ) || E'\\n);' ||
+    E',\n'
+  ) || E'\n);' ||
   CASE WHEN t.table_comment IS NOT NULL THEN
-    E'\\n\\nCOMMENT ON TABLE ' || tc.schemaname || '.' || tc.tablename ||
+    E'\n\nCOMMENT ON TABLE ' || tc.schemaname || '.' || tc.tablename ||
     ' IS ' || quote_literal(t.table_comment) || ';'
   ELSE '' END ||
   CASE WHEN COUNT(tc.column_comment) FILTER (WHERE tc.column_comment IS NOT NULL) > 0 THEN
-    E'\\n\\n' || string_agg(
+    E'\n\n' || string_agg(
       CASE WHEN tc.column_comment IS NOT NULL THEN
         'COMMENT ON COLUMN ' || tc.schemaname || '.' || tc.tablename || '.' || tc.column_name ||
         ' IS ' || quote_literal(tc.column_comment) || ';'
       ELSE NULL END,
-      E'\\n'
+      E'\n'
     )
   ELSE '' END AS create_statement
 FROM table_columns tc
@@ -136,7 +165,7 @@ const TABLE_SCHEMAS_SELECT = `
 SELECT
   tc.schemaname,
   tc.tablename,
-  'CREATE TABLE ' || tc.schemaname || '.' || tc.tablename || E'(\\n' ||
+  'CREATE TABLE ' || tc.schemaname || '.' || tc.tablename || E'(\n' ||
   array_to_string(
     array_agg(
       '    ' || tc.column_name || ' ' || tc.type ||
@@ -144,19 +173,19 @@ SELECT
       CASE WHEN tc.default_value IS NOT NULL THEN ' DEFAULT ' || tc.default_value ELSE '' END
       ORDER BY tc.attnum
     ),
-    E',\\n'
-  ) || E'\\n);' ||
+    E',\n'
+  ) || E'\n);' ||
   CASE WHEN t.table_comment IS NOT NULL THEN
-    E'\\n\\nCOMMENT ON TABLE ' || tc.schemaname || '.' || tc.tablename ||
+    E'\n\nCOMMENT ON TABLE ' || tc.schemaname || '.' || tc.tablename ||
     ' IS ' || quote_literal(t.table_comment) || ';'
   ELSE '' END ||
   CASE WHEN COUNT(tc.column_comment) FILTER (WHERE tc.column_comment IS NOT NULL) > 0 THEN
-    E'\\n\\n' || string_agg(
+    E'\n\n' || string_agg(
       CASE WHEN tc.column_comment IS NOT NULL THEN
         'COMMENT ON COLUMN ' || tc.schemaname || '.' || tc.tablename || '.' || tc.column_name ||
         ' IS ' || quote_literal(tc.column_comment) || ';'
       ELSE NULL END,
-      E'\\n'
+      E'\n'
     )
   ELSE '' END AS create_statement
 FROM table_columns tc
@@ -260,14 +289,17 @@ class PostgresServer {
   private readonly readOnlyMode: boolean;
   private readonly queryValidator: QueryValidator;
   private readonly serverName: string;
+  private readonly databaseUrl: string;
   private readonly toolName: string;
-  private transport?: StdioServerTransport;
+  private transport?: Transport;
+  private sessionId?: string;
 
   constructor() {
-    this.serverName = process.env.MCP_SERVER_NAME ?? 'postgres-mcp';
+    this.serverName = SERVER_NAME;
+    this.databaseUrl = DATABASE_URL;
     this.toolName = `${this.serverName}_query`;
 
-    this.readOnlyMode = process.env.READ_ONLY_MODE !== 'false';
+    this.readOnlyMode = resolveReadOnlyMode();
     this.queryValidator = new QueryValidator(this.readOnlyMode);
 
     this.mcp = new McpServer(
@@ -292,6 +324,98 @@ class PostgresServer {
     };
 
     this.registerTools();
+    this.consoleLog('info', 'PostgresServer initialized', {
+      readOnlyMode: this.readOnlyMode,
+    });
+  }
+
+  setSessionId(sessionId: string) {
+    this.sessionId = sessionId;
+    this.consoleLog('info', 'Session identifier attached');
+  }
+
+  getSessionId(): string | undefined {
+    return this.sessionId;
+  }
+
+  private consoleLog(
+    level: 'debug' | 'info' | 'warn' | 'error',
+    message: string,
+    context?: Record<string, unknown>
+  ) {
+    const prefixParts = [`[${this.serverName}]`];
+    if (this.sessionId) {
+      prefixParts.push(`[session:${this.sessionId}]`);
+    }
+    const baseMessage = `${prefixParts.join(' ')} ${message}`;
+    const contextSuffix =
+      context && Object.keys(context).length > 0 ? ` ${JSON.stringify(context)}` : '';
+    const finalMessage = `${baseMessage}${contextSuffix}`;
+
+    switch (level) {
+      case 'error':
+        console.error(finalMessage);
+        break;
+      case 'warn':
+        console.warn(finalMessage);
+        break;
+      case 'debug':
+        console.debug(finalMessage);
+        break;
+      default:
+        console.log(finalMessage);
+    }
+  }
+
+  async connect(
+    transport: Transport,
+    options: {
+      label?: string;
+      onTransportClosed?: () => void;
+      onTransportError?: (error: Error) => void;
+    } = {}
+  ) {
+    if (this.transport) {
+      throw new Error('Server is already connected to a transport');
+    }
+
+    const transportLabel = options.label ?? 'transport';
+    this.consoleLog('info', 'Attaching transport', { transport: transportLabel });
+
+    this.transport = transport;
+    transport.onclose = () => {
+      options.onTransportClosed?.();
+      void this.handleTransportClosed(transportLabel);
+    };
+    transport.onerror = (error: Error) => {
+      this.consoleLog('error', 'Transport error observed', {
+        transport: transportLabel,
+        error: error.message,
+      });
+      options.onTransportError?.(error);
+    };
+
+    try {
+      await this.mcp.connect(transport);
+      await this.log('info', { message: `${this.serverName} server running on ${transportLabel}` });
+      this.consoleLog('info', 'MCP server connected', { transport: transportLabel });
+    } catch (error) {
+      this.transport = undefined;
+      const formattedError = error instanceof Error ? error.message : String(error);
+      this.consoleLog('error', 'Failed to connect transport', {
+        transport: transportLabel,
+        error: formattedError,
+      });
+
+      if (this.mcp.isConnected()) {
+        await this.log('error', {
+          message: 'Server failed to start',
+          error: formattedError,
+        });
+      }
+
+      throw error;
+    }
   }
 
   private registerTools() {
@@ -362,7 +486,6 @@ class PostgresServer {
         return this.executeQuery({
           query,
           params,
-          connectionString: args.connectionString,
           maxRows: args.maxRows ?? config.defaultMaxRows,
           timeoutMs: args.timeoutMs,
         });
@@ -387,6 +510,9 @@ class PostgresServer {
   private async ensureClient(connectionString: string): Promise<Client> {
     const existing = this.connections.get(connectionString);
     if (existing) {
+      this.consoleLog('debug', 'Reusing cached database connection', {
+        connection: this.describeConnection(connectionString),
+      });
       return existing;
     }
 
@@ -411,6 +537,9 @@ class PostgresServer {
     const client = new Client({ connectionString });
 
     try {
+      this.consoleLog('info', 'Opening new database connection', {
+        connection: this.describeConnection(connectionString),
+      });
       await client.connect();
       this.registerClientLifecycle(connectionString, client);
 
@@ -421,11 +550,17 @@ class PostgresServer {
           connection: this.describeConnection(connectionString),
           readOnlyMode: true,
         });
+        this.consoleLog('info', 'Connection established in read-only mode', {
+          connection: this.describeConnection(connectionString),
+        });
       } else {
         await this.log('info', {
           message: 'Connection established',
           connection: this.describeConnection(connectionString),
           readOnlyMode: false,
+        });
+        this.consoleLog('info', 'Connection established', {
+          connection: this.describeConnection(connectionString),
         });
       }
 
@@ -451,6 +586,9 @@ class PostgresServer {
         this.connections.delete(connectionString);
       }
       cleanup();
+      this.consoleLog('info', 'Database connection ended', {
+        connection: this.describeConnection(connectionString),
+      });
     };
 
     const onError = (error: Error) => {
@@ -458,11 +596,10 @@ class PostgresServer {
         this.connections.delete(connectionString);
       }
       cleanup();
-      process.stderr.write(
-        `[${this.serverName}] connection error (${this.describeConnection(connectionString)}): ${
-          error.message
-        }\n`
-      );
+      this.consoleLog('error', 'Database connection error detected', {
+        connection: this.describeConnection(connectionString),
+        error: error.message,
+      });
     };
 
     client.on('end', onEnd);
@@ -475,11 +612,9 @@ class PostgresServer {
     try {
       await client.end();
     } catch (error) {
-      process.stderr.write(
-        `[${this.serverName}] failed to close database client: ${
-          error instanceof Error ? error.message : String(error)
-        }\n`
-      );
+      this.consoleLog('warn', 'Failed to close database client', {
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -496,9 +631,10 @@ class PostgresServer {
     }
 
     if (reason) {
-      process.stderr.write(
-        `[${this.serverName}] dropping connection (${this.describeConnection(connectionString)}): ${reason}\n`
-      );
+      this.consoleLog('warn', 'Dropping cached database connection', {
+        connection: this.describeConnection(connectionString),
+        reason,
+      });
     }
 
     await this.safeCloseClient(client);
@@ -511,6 +647,12 @@ class PostgresServer {
 
     const entries = Array.from(this.connections.entries());
     this.connections.clear();
+
+    if (entries.length > 0) {
+      this.consoleLog('info', 'Disposing remaining database clients', {
+        count: entries.length,
+      });
+    }
 
     await Promise.all(
       entries.map(([connectionString, client]) => this.dropClient(connectionString, client))
@@ -556,24 +698,25 @@ class PostgresServer {
   }
 
   private async executeQuery(args: QueryArgs) {
-    const connectionString = args.connectionString || process.env.DATABASE_URL;
-
-    if (!connectionString) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        'Connection string is required. Provide connectionString parameter or set DATABASE_URL environment variable'
-      );
-    }
+    const connectionString = this.databaseUrl;
 
     this.queryValidator.validateOrThrow(args.query);
 
     const { text, values } = this.buildQuery(args);
+    const connectionDescription = this.describeConnection(connectionString);
+    const querySummary = text.length > 500 ? `${text.slice(0, 500)}…` : text;
+    this.consoleLog('info', 'Executing query', {
+      connection: connectionDescription,
+      hasParams: values.length > 0,
+      maxRows: args.maxRows ?? 10,
+    });
 
     let lastError: unknown;
 
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const client = await this.ensureClient(connectionString);
       let timeoutConfigured = false;
+      const start = Date.now();
 
       try {
         if (args.timeoutMs) {
@@ -583,6 +726,7 @@ class PostgresServer {
 
         const result = await client.query({ text, values });
         const rowCount = typeof result.rowCount === 'number' ? result.rowCount : result.rows.length;
+        const durationMs = Date.now() - start;
 
         const structuredContent: QueryResult = {
           rowCount,
@@ -592,6 +736,12 @@ class PostgresServer {
             dataTypeID: field.dataTypeID,
           })),
         };
+
+        this.consoleLog('info', 'Query succeeded', {
+          connection: connectionDescription,
+          rowCount,
+          durationMs,
+        });
 
         return {
           structuredContent,
@@ -605,12 +755,40 @@ class PostgresServer {
       } catch (error) {
         lastError = error;
 
-        if (this.isConnectionError(error)) {
-          await this.dropClient(connectionString, client, 'connection error');
+        if (error instanceof McpError) {
+          this.consoleLog('warn', 'Query failed with MCP error', {
+            connection: connectionDescription,
+            error: error.message,
+            attempt,
+          });
+          throw error;
+        }
+
+        if (error instanceof Error) {
+          await this.log('error', {
+            message: 'Database query failed',
+            error: error.message,
+            connection: this.describeConnection(connectionString),
+            attempt,
+          });
+        }
+
+        if (error instanceof Error && this.isConnectionError(error)) {
+          const connection = this.connections.get(connectionString);
+
+          if (connection) {
+            await this.dropClient(connectionString, connection, error.message);
+          }
 
           await this.log('warning', {
-            message: 'Database connection reset; retrying query',
+            message: 'Database connection error, retrying query',
+            error: error.message,
             connection: this.describeConnection(connectionString),
+            attempt,
+          });
+          this.consoleLog('warn', 'Database connection error during query execution', {
+            connection: connectionDescription,
+            error: error.message,
             attempt,
           });
 
@@ -618,6 +796,13 @@ class PostgresServer {
             continue;
           }
         }
+
+        this.consoleLog('error', 'Query failed', {
+          connection: connectionDescription,
+          error: error instanceof Error ? error.message : 'Unknown error',
+          attempt,
+          query: querySummary,
+        });
 
         return {
           isError: true,
@@ -637,10 +822,20 @@ class PostgresServer {
               message: 'Failed to reset statement_timeout after query',
               error: resetError instanceof Error ? resetError.message : String(resetError),
             });
+            this.consoleLog('warn', 'Failed to reset statement_timeout', {
+              connection: connectionDescription,
+              error: resetError instanceof Error ? resetError.message : String(resetError),
+            });
           }
         }
       }
     }
+
+    this.consoleLog('error', 'Query failed after retries', {
+      connection: connectionDescription,
+      error: lastError instanceof Error ? lastError.message : 'Unknown error',
+      query: querySummary,
+    });
 
     return {
       isError: true,
@@ -653,88 +848,371 @@ class PostgresServer {
     };
   }
 
-  async run() {
-    if (this.transport) {
-      throw new Error('Server is already running');
-    }
-
-    this.transport = new StdioServerTransport();
-    this.transport.onclose = () => {
-      void this.handleTransportClosed('transport');
-    };
-
-    try {
-      await this.mcp.connect(this.transport);
-      await this.log('info', { message: `${this.serverName} server running on stdio` });
-    } catch (error) {
-      if (this.mcp.isConnected()) {
-        await this.log('error', {
-          message: 'Server failed to start',
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-      throw error;
-    }
-  }
-
   private async handleTransportClosed(source: string) {
-    process.stderr.write(
-      `[${this.serverName}] MCP transport closed (${source}), clearing cached database connections.\n`
-    );
+    this.consoleLog('info', 'Transport closed, clearing cached database connections', {
+      source,
+    });
     await this.disposeAllClients();
     this.transport = undefined;
   }
 
   async shutdown() {
+    this.consoleLog('info', 'Shutting down PostgresServer instance');
     try {
       if (this.mcp.isConnected()) {
         await this.mcp.close();
       }
     } catch (error) {
-      process.stderr.write(
-        `Failed to close MCP server: ${error instanceof Error ? error.message : String(error)}\n`
-      );
+      this.consoleLog('error', 'Failed to close MCP server', {
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
 
     if (this.transport) {
       try {
         await this.transport.close?.();
       } catch (closeError) {
-        process.stderr.write(
-          `Failed to close transport: ${closeError instanceof Error ? closeError.message : String(closeError)}\n`
-        );
+        this.consoleLog('error', 'Failed to close transport', {
+          error: closeError instanceof Error ? closeError.message : String(closeError),
+        });
       } finally {
         this.transport = undefined;
       }
     }
 
     await this.disposeAllClients();
+    this.consoleLog('info', 'PostgresServer shutdown complete');
   }
 }
 
-const server = new PostgresServer();
+type SessionEntry = {
+  transport: StreamableHTTPServerTransport;
+  server: PostgresServer;
+};
 
-// Graceful termination handlers
-const gracefulExit = async (signal: string) => {
-  process.stderr.write(`\nReceived ${signal}, shutting down gracefully...\n`);
-  try {
-    await server.shutdown();
-    process.exit(0);
-  } catch (error) {
-    process.stderr.write(
-      `Failed to shut down cleanly: ${error instanceof Error ? error.message : String(error)}\n`
-    );
-    process.exit(1);
+type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+
+const serverName = SERVER_NAME;
+
+const globalLog = (level: LogLevel, message: string, context?: Record<string, unknown>) => {
+  const prefix = `[${serverName}] [http]`;
+  const contextSuffix =
+    context && Object.keys(context).length > 0 ? ` ${JSON.stringify(context)}` : '';
+  const finalMessage = `${prefix} ${message}${contextSuffix}`;
+
+  switch (level) {
+    case 'error':
+      console.error(finalMessage);
+      break;
+    case 'warn':
+      console.warn(finalMessage);
+      break;
+    case 'debug':
+      console.debug(finalMessage);
+      break;
+    default:
+      console.log(finalMessage);
   }
 };
 
-process.on('SIGINT', () => void gracefulExit('SIGINT'));
-process.on('SIGTERM', () => void gracefulExit('SIGTERM'));
+const normalizePort = (value: string | undefined, fallback: number): number => {
+  if (!value) {
+    return fallback;
+  }
 
-// Start the server
-server.run().catch(async (error) => {
-  process.stderr.write(
-    `Server failed to start: ${error instanceof Error ? error.message : String(error)}\n`
+  const parsed = Number.parseInt(value, 10);
+  return Number.isNaN(parsed) ? fallback : parsed;
+};
+
+const extractJsonRpcId = (body: unknown): string | number | null | undefined => {
+  if (!body || typeof body !== 'object') {
+    return undefined;
+  }
+
+  if ('id' in body) {
+    const id = (body as { id?: unknown }).id;
+    if (typeof id === 'string' || typeof id === 'number' || id === null) {
+      return id;
+    }
+  }
+
+  return undefined;
+};
+
+const previewBody = (body: unknown): string => {
+  try {
+    const serialized = typeof body === 'string' ? body : JSON.stringify(body);
+    return serialized ? serialized.slice(0, 200) : '';
+  } catch {
+    return '[unserializable body]';
+  }
+};
+
+const MCP_PORT = normalizePort(process.env.MCP_PORT, 6123);
+
+const deriveAllowedHosts = (): string[] => {
+  const hosts = new Set<string>(['127.0.0.1', 'localhost']);
+
+  if (Number.isFinite(MCP_PORT)) {
+    hosts.add(`127.0.0.1:${MCP_PORT}`);
+    hosts.add(`localhost:${MCP_PORT}`);
+  }
+
+  const envHosts = process.env.MCP_ALLOWED_HOSTS;
+  if (envHosts) {
+    envHosts
+      .split(',')
+      .map((host) => host.trim())
+      .filter((host) => host.length > 0)
+      .forEach((host) => hosts.add(host));
+  }
+
+  return Array.from(hosts);
+};
+
+const derivedAllowedHosts = deriveAllowedHosts();
+
+globalLog('info', 'Starting Streamable HTTP MCP server', {
+  port: MCP_PORT,
+  readOnlyMode: resolveReadOnlyMode(),
+});
+
+const app = express();
+
+app.use(
+  cors({
+    origin: true,
+    credentials: true,
+    exposedHeaders: ['Mcp-Session-Id'],
+  })
+);
+app.use(express.json({ limit: '5mb' }));
+
+const sessions = new Map<string, SessionEntry>();
+
+const createSessionServer = () => new PostgresServer();
+
+const getSessionEntry = (sessionId: string | undefined) => {
+  if (!sessionId) {
+    return undefined;
+  }
+  return sessions.get(sessionId);
+};
+
+app.post('/mcp', async (req: Request, res: Response) => {
+  const sessionIdHeader = req.header('mcp-session-id') ?? undefined;
+  const sessionEntry = getSessionEntry(sessionIdHeader);
+  const requestId = extractJsonRpcId(req.body);
+
+  globalLog('info', 'Received POST /mcp', {
+    sessionId: sessionIdHeader ?? 'new',
+    hasSession: Boolean(sessionEntry),
+    requestId: requestId ?? null,
+    bodyPreview: previewBody(req.body),
+  });
+
+  let createdTransport: StreamableHTTPServerTransport | undefined;
+  let createdServer: PostgresServer | undefined;
+
+  try {
+    if (sessionEntry) {
+      await sessionEntry.transport.handleRequest(req, res, req.body);
+      return;
+    }
+
+    if (!isInitializeRequest(req.body)) {
+      res.status(400).json({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
+        id: null,
+      });
+      return;
+    }
+
+    createdServer = createSessionServer();
+    createdTransport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      enableDnsRebindingProtection: true,
+      allowedHosts: derivedAllowedHosts,
+      onsessioninitialized: (initializedSessionId) => {
+        createdServer?.setSessionId(initializedSessionId);
+        sessions.set(initializedSessionId, { transport: createdTransport!, server: createdServer! });
+        globalLog('info', 'Session initialized', { sessionId: initializedSessionId });
+      },
+    });
+
+    await createdServer.connect(createdTransport, {
+      label: 'streamable-http',
+      onTransportClosed: () => {
+        const activeSessionId = createdTransport?.sessionId ?? createdServer?.getSessionId();
+        if (activeSessionId && sessions.has(activeSessionId)) {
+          sessions.delete(activeSessionId);
+          globalLog('info', 'Transport closed and session removed', {
+            sessionId: activeSessionId,
+          });
+        }
+      },
+      onTransportError: (error) => {
+        globalLog('error', 'Transport error emitted', {
+          sessionId: createdTransport?.sessionId ?? createdServer?.getSessionId(),
+          error: error.message,
+        });
+      },
+    });
+
+    await createdTransport.handleRequest(req, res, req.body);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    globalLog('error', 'Error handling POST /mcp', {
+      sessionId: sessionIdHeader ?? createdTransport?.sessionId ?? 'unknown',
+      error: message,
+    });
+
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: '2.0',
+        error: { code: -32603, message: 'Internal server error' },
+        id: null,
+      });
+    }
+
+    if (createdServer && (!createdTransport?.sessionId || !sessions.has(createdTransport.sessionId))) {
+      try {
+        await createdServer.shutdown();
+      } catch (shutdownError) {
+        globalLog('error', 'Failed to shut down server after POST error', {
+          error: shutdownError instanceof Error ? shutdownError.message : String(shutdownError),
+        });
+      }
+    }
+  }
+});
+
+app.get('/mcp', async (req: Request, res: Response) => {
+  const sessionId = req.header('mcp-session-id') ?? undefined;
+  const entry = getSessionEntry(sessionId);
+
+  globalLog('info', 'Received GET /mcp', {
+    sessionId: sessionId ?? 'missing',
+    hasSession: Boolean(entry),
+    lastEventId: req.header('last-event-id') ?? null,
+  });
+
+  if (!entry) {
+    res.status(400).send('Invalid or missing session ID');
+    return;
+  }
+
+  try {
+    await entry.transport.handleRequest(req, res);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    globalLog('error', 'Error handling GET /mcp', {
+      sessionId,
+      error: message,
+    });
+
+    if (!res.headersSent) {
+      res.status(500).send('Internal server error');
+    }
+  }
+});
+
+app.delete('/mcp', async (req: Request, res: Response) => {
+  const sessionId = req.header('mcp-session-id') ?? undefined;
+  const entry = getSessionEntry(sessionId);
+
+  globalLog('info', 'Received DELETE /mcp', {
+    sessionId: sessionId ?? 'missing',
+    hasSession: Boolean(entry),
+  });
+
+  if (!entry) {
+    res.status(400).send('Invalid or missing session ID');
+    return;
+  }
+
+  try {
+    await entry.transport.handleRequest(req, res);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    globalLog('error', 'Error handling DELETE /mcp', {
+      sessionId,
+      error: message,
+    });
+
+    if (!res.headersSent) {
+      res.status(500).send('Internal server error');
+    }
+  }
+});
+
+const httpServer = app.listen(MCP_PORT, () => {
+  globalLog('info', 'Streamable HTTP MCP server listening', { port: MCP_PORT });
+});
+
+const closeHttpServer = async () =>
+  new Promise<void>((resolve) => {
+    httpServer.close((error?: Error) => {
+      if (error) {
+        globalLog('error', 'Error closing HTTP server', { error: error.message });
+      } else {
+        globalLog('info', 'HTTP server closed');
+      }
+      resolve();
+    });
+  });
+
+const shutdownSessions = async () => {
+  const sessionIds = Array.from(sessions.keys());
+  if (sessionIds.length === 0) {
+    return;
+  }
+
+  globalLog('info', 'Closing active sessions', { count: sessionIds.length });
+
+  await Promise.all(
+    sessionIds.map(async (sessionId) => {
+      const entry = sessions.get(sessionId);
+      if (!entry) {
+        return;
+      }
+
+      try {
+        globalLog('info', 'Closing session', { sessionId });
+        await entry.server.shutdown();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        globalLog('error', 'Failed to cleanly close session', { sessionId, error: message });
+      } finally {
+        sessions.delete(sessionId);
+      }
+    })
   );
-  process.exit(1);
+};
+
+const gracefulShutdown = async (signal: string) => {
+  globalLog('info', 'Received shutdown signal', { signal });
+
+  await shutdownSessions();
+  await closeHttpServer();
+
+  globalLog('info', 'Shutdown complete', { signal });
+  process.exit(0);
+};
+
+process.on('SIGINT', () => {
+  void gracefulShutdown('SIGINT');
+});
+
+process.on('SIGTERM', () => {
+  void gracefulShutdown('SIGTERM');
+});
+
+process.on('uncaughtException', (error: Error) => {
+  globalLog('error', 'Uncaught exception', { error: error.message, stack: error.stack });
+});
+
+process.on('unhandledRejection', (reason: unknown) => {
+  globalLog('error', 'Unhandled rejection', { reason: String(reason) });
 });

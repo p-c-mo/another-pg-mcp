@@ -1,10 +1,8 @@
 # PostgreSQL MCP Server
 
-A Model Context Protocol (MCP) server that enables querying PostgreSQL databases.
-
-I built this because the reference because clients had trouble with the reference Postgres MCP server when there were mulitple databases. This version passes through a user specified server name to the client.
-
-Note: There are probably better implementations out there, but it's currently a pain to find them.
+A Model Context Protocol (MCP) server that exposes PostgreSQL over the Streamable HTTP transport.  
+It manages per-session database connections, enforces optional read-only access, and adds
+structured logging to help debug queries and connectivity issues.
 
 ## Installation
 
@@ -13,52 +11,78 @@ npm install
 npm run build
 ```
 
+## Running the server
+
+```bash
+# build (optional if you use `npm run dev`)
+npm run build
+
+# start the compiled server
+node dist/index.js
+
+# or run directly with hot reload while developing
+npm run dev
+```
+
+By default the server listens on `http://localhost:3000/mcp`. Set `MCP_PORT` to override the port.
+
 ## Configuration
 
-The server uses PostgreSQL connection strings. You can either:
+The server loads configuration from environment variables (via `.env`).  
+Set the `DATABASE_URL` environment variable before starting the server so every tool call uses the same PostgreSQL instance.
 
-1. Set the `DATABASE_URL` environment variable
-2. Pass a `connectionString` parameter directly to the query tool
+Example `.env`:
 
-Connection string format: `postgresql://user:password@host:port/database`
+```env
+DATABASE_URL=postgresql://user:password@host:5432/database
+MCP_SERVER_NAME=postgres-mcp
+```
+
+The server will refuse to start if `DATABASE_URL` is missing.
 
 ### Environment Variables
 
-#### MCP_SERVER_NAME
-You can customize the MCP server name using the `MCP_SERVER_NAME` environment variable. This is useful when running multiple PostgreSQL connections to distinguish between them.
+| Variable              | Default | Description |
+| --------------------- | ------- | ----------- |
+| `DATABASE_URL`        | —       | PostgreSQL connection string loaded at startup (required). |
+| `MCP_SERVER_NAME`     | `postgres-mcp` | Label used in log messages and tool names. Helpful when you run multiple instances. |
+| `MCP_READ_ONLY_MODE`* | `true`  | When truthy, enforces read-only sessions via `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` and validates queries. Set to `false` to allow writes. (`READ_ONLY_MODE` is still honoured for backwards compatibility.) |
+| `MCP_PORT`            | `3000`  | Streamable HTTP port. |
 
-Example:
-```bash
-MCP_SERVER_NAME="postgres-production" npm start
-```
+> \* Any non-empty value other than `"false"` keeps read-only mode enabled.
 
-#### READ_ONLY_MODE
-Controls whether the server enforces read-only mode to prevent write operations. Defaults to `true` for security.
+## HTTP interface
 
-- `READ_ONLY_MODE=true` (default): Prevents INSERT, UPDATE, DELETE, CREATE, ALTER, DROP operations
-- `READ_ONLY_MODE=false`: Allows all operations based on user permissions
+The server implements the Streamable HTTP transport:
 
-## Usage
+| Method | Path       | Description                                                                                               |
+| ------ | ---------- | --------------------------------------------------------------------------------------------------------- |
+| POST   | `/mcp`     | Handles JSON-RPC requests. Initialization responses include a `Mcp-Session-Id` header for subsequent calls. |
+| GET    | `/mcp`     | Establishes the server-sent event stream for notifications. Requires `mcp-session-id` header.             |
+| DELETE | `/mcp`     | Terminates the session identified by `mcp-session-id`.                                                    |
 
+Every session is isolated: database connections, query caches, and transport state are scoped to the generated session ID. Comprehensive logs are emitted to stdout/stderr with the pattern `[postgres-mcp] [http] ...` or `[postgres-mcp] [session:abc123] ...`.
 
-### Using with Claude Desktop
+## Client configuration
 
-Add this to your Claude Desktop configuration:
+Point your MCP client at the HTTP endpoint. Example entry for `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "postgres": {
-      "command": "node",
-      "args": ["/path/to/postgres-mcp/dist/index.js"],
-      "env": {
-        "DATABASE_URL": "postgresql://myuser:mypassword@localhost:5432/mydb",
-        "MCP_SERVER_NAME": "this-server-name"
+      "transport": {
+        "type": "streamable-http",
+        "url": "http://localhost:3000/mcp"
       }
     }
   }
 }
 ```
+
+Set environment variables for the server process (e.g., via `.env`, your process manager, or shell exports) before launching it.
+
+## Tools
 
 ### Available Tools
 
@@ -68,7 +92,6 @@ Execute a PostgreSQL query.
 
 Parameters:
 - `query` (required): The SQL query to execute
-- `connectionString` (optional): PostgreSQL connection string (uses DATABASE_URL env var if not provided)
 
 Example:
 ```json
@@ -76,3 +99,5 @@ Example:
   "query": "SELECT * FROM users LIMIT 10"
 }
 ```
+
+All tools run against the database specified by `DATABASE_URL`.
