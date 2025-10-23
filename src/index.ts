@@ -9,14 +9,6 @@ import { QueryValidator } from './queryValidator.js';
 
 const QueryInputShape = {
   query: z.string().describe('SQL to execute'),
-  connectionString: z
-    .string()
-    .optional()
-    .describe('Overrides DATABASE_URL'),
-  params: z
-    .array(z.union([z.string(), z.number(), z.boolean(), z.null()]))
-    .optional()
-    .describe('Positional parameters ($1, $2, ...)'),
   maxRows: z
     .number()
     .int()
@@ -35,6 +27,34 @@ const QueryInputShape = {
 
 const QueryInputSchema = z.object(QueryInputShape);
 
+const SharedPredefinedInputShape = {
+  maxRows: QueryInputShape.maxRows,
+  timeoutMs: QueryInputShape.timeoutMs,
+  schema: z
+    .string()
+    .optional()
+    .describe('Limit results to a specific schema'),
+};
+
+const ViewSchemasInputShape = {
+  ...SharedPredefinedInputShape,
+  view: z
+    .string()
+    .optional()
+    .describe('Limit results to a specific view name'),
+};
+
+const TableSchemasInputShape = {
+  ...SharedPredefinedInputShape,
+  table: z
+    .string()
+    .optional()
+    .describe('Limit results to a specific table name'),
+};
+
+const ViewSchemasInputSchema = z.object(ViewSchemasInputShape);
+const TableSchemasInputSchema = z.object(TableSchemasInputShape);
+
 const QueryOutputShape = {
   rowCount: z.number(),
   rows: z.array(z.record(z.any())),
@@ -44,26 +64,6 @@ const QueryOutputShape = {
 };
 
 const QueryOutputSchema = z.object(QueryOutputShape);
-
-const PredefinedQueryInputShape = {
-  connectionString: QueryInputShape.connectionString,
-  maxRows: QueryInputShape.maxRows,
-  timeoutMs: QueryInputShape.timeoutMs,
-  schema: z
-    .string()
-    .optional()
-    .describe('Limit results to a specific schema'),
-  table: z
-    .string()
-    .optional()
-    .describe('Limit results to a specific table name'),
-  view: z
-    .string()
-    .optional()
-    .describe('Limit results to a specific view name'),
-};
-
-const PredefinedQueryInputSchema = z.object(PredefinedQueryInputShape);
 
 const VIEW_SCHEMAS_BASE = `
 SELECT *
@@ -168,9 +168,9 @@ GROUP BY tc.schemaname, tc.tablename, t.table_comment
 ORDER BY tc.schemaname, tc.tablename
 `.trim();
 
-function buildViewSchemasQuery(args: PredefinedQueryArgs) {
+function buildViewSchemasQuery(args: ViewSchemasArgs) {
   const conditions: string[] = [];
-  const params: (string | number)[] = [];
+  const params: QueryParameter[] = [];
   let paramIndex = 1;
 
   if (args.schema) {
@@ -192,9 +192,9 @@ function buildViewSchemasQuery(args: PredefinedQueryArgs) {
   return { query, params };
 }
 
-function buildTableSchemasQuery(args: PredefinedQueryArgs) {
+function buildTableSchemasQuery(args: TableSchemasArgs) {
   const conditions: string[] = [];
-  const params: (string | number)[] = [];
+  const params: QueryParameter[] = [];
   let paramIndex = 1;
 
   if (args.schema) {
@@ -217,7 +217,9 @@ function buildTableSchemasQuery(args: PredefinedQueryArgs) {
 }
 
 type QueryArgs = z.infer<typeof QueryInputSchema>;
-type PredefinedQueryArgs = z.infer<typeof PredefinedQueryInputSchema>;
+type ViewSchemasArgs = z.infer<typeof ViewSchemasInputSchema>;
+type TableSchemasArgs = z.infer<typeof TableSchemasInputSchema>;
+type QueryParameter = string | number | boolean | null;
 type QueryResult = z.infer<typeof QueryOutputSchema>;
 
 class PostgresServer {
@@ -299,7 +301,7 @@ class PostgresServer {
       this.toolName,
       {
         title: `${this.serverName} Query`,
-        description: 'Execute a PostgreSQL query with optional parameters',
+        description: 'Execute a PostgreSQL query',
         inputSchema: QueryInputShape,
         outputSchema: QueryOutputShape,
         annotations: { readOnlyHint: this.readOnlyMode },
@@ -310,6 +312,7 @@ class PostgresServer {
     this.registerPredefinedQueryTool('view_schemas', {
       title: 'View Schemas',
       description: 'List non-system PostgreSQL view definitions by schema',
+      inputSchema: ViewSchemasInputSchema,
       buildQuery: buildViewSchemasQuery,
       defaultMaxRows: 1_000_000,
     });
@@ -317,6 +320,7 @@ class PostgresServer {
     this.registerPredefinedQueryTool('table_schemas', {
       title: 'Table Schemas',
       description: 'View table schemas (with comments) - generates CREATE TABLE statements',
+      inputSchema: TableSchemasInputSchema,
       buildQuery: buildTableSchemasQuery,
       defaultMaxRows: 1_000_000,
     });
@@ -334,14 +338,15 @@ class PostgresServer {
     });
   }
 
-  private registerPredefinedQueryTool(
+  private registerPredefinedQueryTool<T extends z.ZodObject<z.ZodRawShape>>(
     name: string,
     config: {
       title: string;
       description: string;
-      buildQuery: (args: PredefinedQueryArgs) => {
+      inputSchema: T;
+      buildQuery: (args: z.infer<T>) => {
         query: string;
-        params?: QueryArgs['params'];
+        params?: QueryParameter[];
       };
       defaultMaxRows?: number;
     }
@@ -353,19 +358,20 @@ class PostgresServer {
       {
         title: config.title,
         description: config.description,
-        inputSchema: PredefinedQueryInputShape,
+        inputSchema: config.inputSchema.shape,
         outputSchema: QueryOutputShape,
         annotations: { readOnlyHint: this.readOnlyMode },
       },
-      async (args: PredefinedQueryArgs) => {
+      async (args: z.infer<T>) => {
         const { query, params } = config.buildQuery(args);
-        return this.executeQuery({
-          query,
-          params,
-          connectionString: args.connectionString,
-          maxRows: args.maxRows ?? config.defaultMaxRows,
-          timeoutMs: args.timeoutMs,
-        });
+        return this.executeQuery(
+          {
+            query,
+            maxRows: args.maxRows ?? config.defaultMaxRows,
+            timeoutMs: args.timeoutMs,
+          },
+          params
+        );
       }
     );
   }
@@ -519,26 +525,19 @@ class PostgresServer {
 
   private buildQuery(args: QueryArgs) {
     const sanitizedQuery = args.query.trim().replace(/;+\s*$/u, '');
-    const values = [...(args.params ?? [])];
     const effectiveMaxRows = args.maxRows ?? 10;
 
     const shouldLimit =
       typeof effectiveMaxRows === 'number' &&
+      Number.isInteger(effectiveMaxRows) &&
       effectiveMaxRows > 0 &&
       /^select/i.test(sanitizedQuery);
 
     if (shouldLimit) {
-      const limitParamPosition = values.length + 1;
-      return {
-        text: `SELECT * FROM (${sanitizedQuery}) AS __mcp_query LIMIT $${limitParamPosition}`,
-        values: [...values, effectiveMaxRows],
-      };
+      return `SELECT * FROM (${sanitizedQuery}) AS __mcp_query LIMIT ${effectiveMaxRows}`;
     }
 
-    return {
-      text: sanitizedQuery,
-      values,
-    };
+    return sanitizedQuery;
   }
 
   private isConnectionError(error: unknown): error is Error & { code?: string } {
@@ -555,19 +554,19 @@ class PostgresServer {
     return PostgresServer.CONNECTION_ERROR_PATTERNS.some((pattern) => message.includes(pattern));
   }
 
-  private async executeQuery(args: QueryArgs) {
-    const connectionString = args.connectionString || process.env.DATABASE_URL;
+  private async executeQuery(args: QueryArgs, queryParameters?: QueryParameter[]) {
+    const connectionString = process.env.DATABASE_URL;
 
     if (!connectionString) {
       throw new McpError(
         ErrorCode.InvalidParams,
-        'Connection string is required. Provide connectionString parameter or set DATABASE_URL environment variable'
+        'Connection string is required. Set DATABASE_URL environment variable'
       );
     }
 
     this.queryValidator.validateOrThrow(args.query);
 
-    const { text, values } = this.buildQuery(args);
+    const text = this.buildQuery(args);
 
     let lastError: unknown;
 
@@ -581,7 +580,11 @@ class PostgresServer {
           timeoutConfigured = true;
         }
 
-        const result = await client.query({ text, values });
+        const parameterValues = queryParameters ?? [];
+        const result =
+          parameterValues.length > 0
+            ? await client.query({ text, values: parameterValues })
+            : await client.query(text);
         const rowCount = typeof result.rowCount === 'number' ? result.rowCount : result.rows.length;
 
         const structuredContent: QueryResult = {
